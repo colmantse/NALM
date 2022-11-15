@@ -1,8 +1,10 @@
-#execute this script to train and validate model performance on dataset, comment out the train and validation section and uncomment the evaluate section to test final model performance. Our codes depend on the tensor2tensor library. Please visit https://github.com/tensorflow/tensor2tensor for more detail. 
+#execute this script to train and validate model performance on dataset, comment out the train and validation section and uncomment the evaluate section 
+#to test final model performance. Our codes depend on the tensor2tensor library. Please visit https://github.com/tensorflow/tensor2tensor for more detail. 
 
 problem=ptb2016_shuffle #see registered problem at usr/t2t_usr/ptb2016.py for more detail
 model=nalm #see registered model at usr/t2t_usr/nalm.py for more detail
-hparams=transformer_base_multistep8 #adjusted based on the number of available gpus, current setting is for dual-gpu machine, see tensor2tensor/models/transformer.py for more detail
+hparams=transformer_base_multistep8 #adjusted based on the number of available gpus, current setting is for dual-gpu machine, 
+                                    #see tensor2tensor/models/transformer.py for more detail
 beam_size=1 #for non-autoregressive model, please set this as 1, for autoregressive model, adjust according to need.
 
 train_dir=./t2t_train/reorder/$problem/$model'_'$hparams
