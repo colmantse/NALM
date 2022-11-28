@@ -47,6 +47,26 @@ import tensorflow as tf
 import six
 
 """function utils"""
+def _add_eos_to_target_ids(labels):
+  # add eos back to target_ids 
+  target_shape = common_layers.shape_list(labels)
+  labels = tf.squeeze(labels)
+  labels = tf.concat([labels,tf.zeros_like(labels[:,:1])],1)
+  target_shape[1] += 1
+  padding = tf.cast(tf.equal(labels,0),dtype=tf.float32)
+  length = common_attention.padding_to_length(padding)
+  eos_at = tf.equal(tf.tile(tf.expand_dims(length,1),[1,target_shape[1]]),tf.cast(tf.range(target_shape[1]),dtype=length.dtype))
+  labels += tf.cast(eos_at,dtype=labels.dtype)
+  return tf.reshape(labels,target_shape)
+
+def add_eos_to_target_ids(labels):
+  labels = tf.cond(tf.reduce_any(tf.equal(labels,1)),lambda: labels, lambda: _add_eos_to_target_ids(labels))
+  return labels
+  
+def add_eos_to_feature_target_ids(features):
+  labels = features['targets']
+  features['targets'] = add_eos_to_target_ids(labels)
+  return features
 
 def aligner_dot(input, to_dot, nonpadding=None):
   if nonpadding is None:
@@ -69,6 +89,7 @@ def aligner_dot(input, to_dot, nonpadding=None):
     return A_logits, a_mask
 
 def batch_upscale(align_matrix):
+  """This function upscale the diagonally consecutive items in the matrix"""
   #align_matrix: B, T, T
   amat = align_matrix
   a_shape=tf.shape(amat)
@@ -121,23 +142,29 @@ def batch_upscale(align_matrix):
   align_matrix=tf.reshape(tf.gather(align_matrix,id),a_shape)
   return align_matrix
 
-def compute_alignment_matrix(inputs, targets, nonpadding):
-  log_info('computing alignment matrix')
-  t_shape = common_layers.shape_list(nonpadding)
-  inputs = tf.reshape(inputs,t_shape[:2])
-  targets = tf.reshape(targets,t_shape[:2])
-  inputs = tf.expand_dims(inputs,-1)
-  targets = tf.expand_dims(targets,1)
-  inputs = tf.tile(inputs,[1,1,t_shape[1]])
-  targets = tf.tile(targets,[1,t_shape[1],1])
-  matrix = tf.cast(tf.equal(inputs,targets),dtype=nonpadding.dtype)
-  num_equal=tf.tile(tf.expand_dims(tf.reduce_sum(matrix,-1),-1),
-                    [1,1,t_shape[1]])
-  # sometimes ground truth and targets might not be completely identical 
-  # because of subword tokenization problem, we clip min to 1 to avoid 
-  # division by 0
-  matrix/=tf.clip_by_value(num_equal,1,tf.reduce_max(num_equal))
-  return matrix*tf.expand_dims(nonpadding,1)
+def compute_alignment_matrix(targets, ground_truth, nonpadding):
+  logit_shape = common_layers.shape_list(nonpadding)
+  targets = tf.reshape(targets,logit_shape[:2])
+  ground_truth = tf.reshape(ground_truth,logit_shape[:2])
+  tgt = tf.tile(tf.expand_dims(targets,-1),[1,1,logit_shape[1]])
+  gt = tf.tile(tf.expand_dims(ground_truth,1),[1,logit_shape[1],1])
+  align_matrix = tf.cast(tf.equal(tgt,gt),dtype=targets.dtype)
+  amat=-batch_upscale(align_matrix)
+  amat += tf.cast(tf.equal(amat,0),dtype=amat.dtype)*logit_shape[1]*10
+  ids = tf.map_fn(lambda x: dummy_wrap_scipy_hungarian(x), amat)
+  return tf.one_hot(ids,logit_shape[1])*tf.expand_dims(nonpadding,1)
+
+def get_avg_embedding(inputs):
+  # accept only [B,T,D] or [B,T,1,D] shape
+  # output [B,1,D]
+  # used for LM
+  input_shape=common_layers.shape_list(inputs)
+  if len(input_shape)==3:
+    inputs = tf.expand_dims(inputs,2)
+    input_shape=common_layers.shape_list(inputs)
+  assert len(input_shape)==4
+  input_length=tf.cast(common_layers.length_from_embedding(inputs),dtype=inputs.dtype)
+  return tf.reduce_sum(inputs,1)/tf.expand_dims(beam_search._expand_to_beam_size(input_length,input_shape[-1]),1)
 
 def get_bos(inputs):
   """ 
@@ -146,12 +173,22 @@ def get_bos(inputs):
   returns: 
     output: a Tensor with shape [B,1,D]
   """
-  input_shape=common_layers.shape_list(inputs)
-  if len(input_shape)==4:
-    inputs = common_layers.flatten4d3d(inputs)
-    input_shape=common_layers.shape_list(inputs)
-  assert len(input_shape)==3
-  return common_layers.shift_right_3d(inputs, None)[:,:1]
+  return tf.reshape(tf.zeros_like(inputs[:,:1]),
+             [tf.shape(inputs)[0],1,tf.shape(inputs)[-1]])
+
+def klx(x, y):
+  def fixprob(att):
+    att = att + 1e-9
+    _sum = tf.reduce_sum(att, reduction_indices=1, keep_dims=True)
+    att = att / _sum
+    att = tf.clip_by_value(att, 1e-9, 1.0, name=None)
+    return att
+
+  x = fixprob(x)
+  y = fixprob(y)
+  X = tf.distributions.Categorical(probs=x)
+  Y = tf.distributions.Categorical(probs=y)
+  return tf.distributions.kl_divergence(X, Y)
 
 def lm_prepare_decoder(targets, hparams, features=None, pad=None):
   # we remove pos embedding in standard prepare_decoder and leave its
@@ -217,6 +254,28 @@ def nalm_prepare_decoder(targets, hparams, features=None, pad=None):
   """
   hparams.pos='' 
   return nalm_pos_prepare_decoder(targets, hparams, features=features, pad=pad)
+
+def permutation_weights(inputs, nonpadding, hparams):
+  num_heads = 1
+  layer_size = hparams.num_encoder_layers
+  hparams.num_encoder_layers = 1
+  inputs = common_layers.flatten4d3d(inputs)
+  bias = common_attention.attention_bias_ignore_padding(1.0-nonpadding)
+  x = transformer_layers.transformer_encoder(inputs, bias, hparams, name='pre_network')
+  x1 = transformer_layers.transformer_encoder(x, bias, hparams, name='q_network')
+  x2 = transformer_layers.transformer_encoder(x, bias, hparams, name='k_network')
+  hparams.num_encoder_layers = layer_size
+  with tf.variable_scope("permutation_matrix",values=[x1,x2]):
+    q,k,_=common_attention.compute_qkv(x1,x2, hparams.hidden_size, hparams.hidden_size)
+    g = tf.sigmoid(tf.matmul(q,tf.cast(tf.get_variable("u",[hparams.hidden_size,1]),dtype=q.dtype)))
+    g = tf.reshape(g, common_layers.shape_list(g)[:-1])
+    diagonal = tf.linalg.diag(tf.ones_like(nonpadding)) #diagonal with 1 as value
+    #dg = diagonal * g
+    pred, mask = aligner_dot(q,k,nonpadding)
+    pred += tf.linalg.diag(nonpadding)*common_attention.large_compatible_negative(q.dtype) # M
+    pred = tf.clip_by_value(pred,common_attention.large_compatible_negative(q.dtype),tf.reduce_max(pred))
+    return diagonal * tf.linalg.diag(g) + (1-diagonal) * tf.tile(tf.expand_dims(
+	(1-g),-1),[1,1,common_layers.shape_list(g)[-1]]) * tf.nn.softmax(pred), mask
 
 def position_attention_layer(input, bias, layer_idx, hparams):
   """position attention layer which is found in snat-r"""
@@ -427,60 +486,9 @@ def select_symbol_top(idx, model_hparams, vocab_size):
     var = modalities.get_weights(model_hparams, vocab_size)
     return tf.gather(var,idx)
 
-def permutation_weights(inputs, nonpadding, hparams):
-  num_heads = 1
-  layer_size = hparams.num_encoder_layers
-  hparams.num_encoder_layers = 1
-  inputs = common_layers.flatten4d3d(inputs)
-  bias = common_attention.attention_bias_ignore_padding(1.0-nonpadding)
-  x = transformer_layers.transformer_encoder(inputs, bias, hparams, name='pre_network')
-  x1 = transformer_layers.transformer_encoder(x, bias, hparams, name='q_network')
-  x2 = transformer_layers.transformer_encoder(x, bias, hparams, name='k_network')
-  hparams.num_encoder_layers = layer_size
-  with tf.variable_scope("permutation_matrix",values=[x1,x2]):
-    q,k,_=common_attention.compute_qkv(x1,x2, hparams.hidden_size, hparams.hidden_size)
-    g = tf.sigmoid(tf.matmul(q,tf.cast(tf.get_variable("u",[hparams.hidden_size,1]),dtype=q.dtype)))
-    g = tf.reshape(g, common_layers.shape_list(g)[:-1])
-    diagonal = tf.linalg.diag(tf.ones_like(nonpadding)) #diagonal with 1 as value
-    #dg = diagonal * g
-    pred, mask = aligner_dot(q,k,nonpadding)
-    pred += tf.linalg.diag(nonpadding)*common_attention.large_compatible_negative(q.dtype) # M
-    pred = tf.clip_by_value(pred,common_attention.large_compatible_negative(q.dtype),tf.reduce_max(pred))
-    return diagonal * tf.linalg.diag(g) + (1-diagonal) * tf.tile(tf.expand_dims(
-	(1-g),-1),[1,1,common_layers.shape_list(g)[-1]]) * tf.nn.softmax(pred), mask
-
-def klx(x, y):
-  def fixprob(att):
-    att = att + 1e-9
-    _sum = tf.reduce_sum(att, reduction_indices=1, keep_dims=True)
-    att = att / _sum
-    att = tf.clip_by_value(att, 1e-9, 1.0, name=None)
-    return att
-
-  x = fixprob(x)
-  y = fixprob(y)
-  X = tf.distributions.Categorical(probs=x)
-  Y = tf.distributions.Categorical(probs=y)
-  return tf.distributions.kl_divergence(X, Y)
-
-def compute_alignment_matrix(inputs, targets, nonpadding):
-  log_info('computing alignment matrix')
-  t_shape = common_layers.shape_list(nonpadding)
-  inputs = tf.reshape(inputs,t_shape[:2])
-  targets = tf.reshape(targets,t_shape[:2])
-  inputs = tf.expand_dims(inputs,-1)
-  targets = tf.expand_dims(targets,1)
-  inputs = tf.tile(inputs,[1,1,t_shape[1]])
-  targets = tf.tile(targets,[1,t_shape[1],1])
-  matrix = tf.cast(tf.equal(inputs,targets),dtype=nonpadding.dtype)
-  num_equal=tf.tile(tf.expand_dims(tf.reduce_sum(matrix,-1),-1),[1,1,t_shape[1]])
-  # sometimes ground truth and targets might not be completely identical because of subword tokenization problem, we clip min to 1 to avoid division by 0
-  matrix/=tf.clip_by_value(num_equal,1,tf.reduce_max(num_equal))
-  return matrix*tf.expand_dims(nonpadding,1)
-
 """decoding algo utils"""
 
-def combine_viterbi(prob_M, prob_R, mask=None, mask_window=1):
+def combine_viterbi(prob_M, prob_R, mask=None, mask_window=0):
   #consider more than 1 seq [Batch, length, length]
   #mask_window=window_size
   if mask is None:
@@ -499,7 +507,7 @@ def combine_viterbi(prob_M, prob_R, mask=None, mask_window=1):
            common_attention.large_compatible_negative(prob_M.dtype),0)
   trellis, score = tf.expand_dims(prob_M[:,0,1:],1), prob_M[:,1:,1:]
   batch_size, seq_len, _ = common_layers.shape_list(score) #seq_len = num_tag
-  if mask_window>1:
+  if mask_window>0:
     m = common_layers.ones_matrix_band_part(seq_len,
                                             seq_len,
                                             mask_window,
@@ -551,7 +559,7 @@ def combine_viterbi(prob_M, prob_R, mask=None, mask_window=1):
             tf.argmax(nt,1,output_type=tf.int32)],-1))
   return order,m,t,b
 
-def combine_align(output, A_matrix, B_matrix, f_mask, mask_window=1):
+def combine_align(output, A_matrix, B_matrix, f_mask, mask_window=0):
   # mask_window is instead window size
   # forward and backward matrices
   # with dimension <bos>+L * <eos>+L
@@ -599,8 +607,10 @@ def perm_align(output, A_matrix, f_mask):
 @registry.register_model
 class lm(transformer.Transformer):
   #this is a standard transformer but adapted for lm-based linearization
+  #the bos token is an average of the entire sequence, this improve 
+  #performance over using 0 by 10 Bleu
   def __init__(self, *args, **kwargs):
-    super(ar_base, self).__init__(*args, **kwargs)
+    super(lm, self).__init__(*args, **kwargs)
     self._prepare_decoder_fn = lm_prepare_decoder
     self._hparams.has_input = self.has_input
 
@@ -650,7 +660,7 @@ class lm(transformer.Transformer):
              **kwargs):
     #decoder_input is shifted
     if mode == 'TRAIN':
-      decoder_input = tf.concat([get_bos(decoder_input),
+      decoder_input = tf.concat([get_avg_embedding(decoder_input),
                         decoder_input[:,1:]],1)
       if hparams.pos == "timing":
         decoder_input = common_attention.add_timing_signal_1d(decoder_input)
@@ -776,7 +786,7 @@ class lm(transformer.Transformer):
         bottom = hparams.bottom.get(
             "targets", modalities.get_targets_bottom(target_modality))
         decoder_input = dp(bottom, partial_targets, hparams, target_vocab_size)[0]
-        bos = dp(get_masked_token, decoder_input, hparams)
+        bos = dp(get_avg_embedding, decoder_input)
         cache['decoder_input'] = common_layers.flatten4d3d(decoder_input)#dp(self._prepare_decoder_fn,common_layers.flatten4d3d(decoder_input),hparams)[0]
         cache['bos'] = bos[0]
 
@@ -989,7 +999,6 @@ class nalm(transformer.Transformer):
     self._prepare_decoder_fn = nalm_prepare_decoder
     self._hparams.has_input = self.has_input
     self.bi = False
-    self.mnalm = False
 
   def bottom(self, features):
     if (self._hparams.mode != tf.estimator.ModeKeys.PREDICT and
@@ -1001,8 +1010,8 @@ class nalm(transformer.Transformer):
     transformed_features = super(nalm, self).bottom(features)
     targets = transformed_features['targets']
     target_shape = common_layers.shape_list(targets)
-    bos = get_bos(targets[:,0:1])
-    bos = tf.reshape(bos, [target_shape[0],1,1,target_shape[-1]])
+    bos = tf.reshape(get_bos(targets), 
+                     [target_shape[0],1,1,target_shape[-1]])
     transformed_features['targets'] = tf.concat([bos,targets],1)
     return transformed_features
 
@@ -1022,7 +1031,7 @@ class nalm(transformer.Transformer):
     #save decoder_input
     self.decoder_input = decoder_input
     padding = common_attention.attention_bias_to_padding(decoder_self_attention_bias)
-    if hparams.get('mask_window',None) is not None and self.mnalm:
+    if hparams.get('mask_window',None) is not None:
       single_width = tf.cond(tf.less(input_shape[1],hparams.mask_window),
                           lambda: input_shape[1],
                           lambda: hparams.mask_window)
@@ -1072,7 +1081,7 @@ class nalm(transformer.Transformer):
       A_mat2=None
       if self.bi:
         logits,l2=logits
-        masks,m2=masks
+        mask,m2=mask
       l_shape = common_layers.shape_list(logits)
       logits = tf.reshape(logits,[l_shape[0],l_shape[1],l_shape[-1]])
       m_shape=common_layers.shape_list(mask)
@@ -1089,7 +1098,8 @@ class nalm(transformer.Transformer):
                  common_layers.shape_list(features["targets"])[:2])
       nonpadding = tf.cast(tf.greater(inputs,1),dtype=inputs.dtype)
       nonpadding = tf.concat([nonpadding[:,0:1],nonpadding],-1)
-      ret = combine_align(inputs,A_matrix,A_mat2,nonpadding,beam_size)
+      ret = combine_align(inputs,A_matrix,A_mat2,nonpadding,
+                          self.hparams.get('mask_window',0))
       ret = tf.squeeze(ret)
       return ret
 
@@ -1161,8 +1171,8 @@ class nalm_pos(nalm):
     transformed_features = super(nalm, self).bottom(features)
     targets = transformed_features['targets']
     target_shape = common_layers.shape_list(targets)
-    bos = get_bos(targets[:,0:1])
-    bos = tf.reshape(bos, [target_shape[0],1,1,target_shape[-1]])
+    bos = tf.reshape(get_bos(targets), 
+                     [target_shape[0],1,1,target_shape[-1]])
     transformed_features['targets'] = tf.concat([bos,targets],1)
     return transformed_features
 
@@ -1199,6 +1209,12 @@ class nalm_pos(nalm):
       xent_bwd = tf.nn.softmax_cross_entropy_with_logits_v2(logits=logits_bwd,labels=a_label_bwd)
       return (tf.reduce_sum(xent)+tf.reduce_sum(xent_bwd))/weights
     return tf.reduce_sum(xent)/weights
+
+@registry.register_model
+class nalm_pos_bi(nalm_pos):
+  def __init__(self, *args, **kwargs):
+    super(nalm_pos_bi, self).__init__(*args, **kwargs)
+    self.bi = True
 
 @registry.register_model
 class reordernatr(transformer.Transformer):
@@ -1477,26 +1493,17 @@ class distortionr(transformer.Transformer):
     return logits * m + (1-m)* common_attention.large_compatible_negative(logits.dtype)
 
   def loss(self, logits, features):
-    #TODO, adapt below for use
     assert 'ground_truth' in features
     targets = features['targets']
-    ground_truth = features.get('ground_truth',None)
+    ground_truth = features['ground_truth']
     logits_shape = common_layers.shape_list(logits)
-    #targets=tf.Print(targets,[logits_shape,tf.shape(targets),tf.shape(ground_truth)],summarize=20)
-    nonpadding = tf.cast(tf.greater(tf.squeeze(targets),1),dtype=logits.dtype)
-    labels = tf.expand_dims(tf.linalg.diag(nonpadding),1)
-    if ground_truth is not None:
-      labels = compute_alignment_matrix(targets, ground_truth, nonpadding)
-    #labels = tf.Print(labels,[tf.reduce_any(tf.is_nan(labels))],message='labels: ')
-    confidence = 1.0 - self._hparams.label_smoothing
-    low_confidence = (1.0 - confidence) / common_layers.to_float(logits_shape[-1] - 1)
-    normalizing = -(
-        confidence * tf.log(confidence) + common_layers.to_float(logits_shape[-1] - 1) *
-        low_confidence * tf.log(low_confidence + 1e-20))
-    #logits = tf.Print(logits,[tf.shape(logits),tf.shape(labels),tf.shape(normalizing)],summarize=150)
-    xent = tf.nn.softmax_cross_entropy_with_logits_v2(logits=logits,labels=labels) - normalizing
-    #xent=tf.Print(xent,[tf.reduce_any(tf.is_nan(xent*nonpadding))],message='xent: ')
-    return tf.reduce_sum(xent*nonpadding),tf.reduce_sum(nonpadding)
+    nonpadding = tf.cast(tf.greater(tf.squeeze(targets),1),
+                 dtype=logits.dtype)
+    #labels = tf.expand_dims(tf.linalg.diag(nonpadding),1)
+    labels = compute_alignment_matrix(targets, ground_truth, nonpadding)
+    xent = tf.nn.softmax_cross_entropy_with_logits_v2(logits=logits,
+                                                      labels=labels)
+    return xent
 
   def infer(self, features,
             decode_length=50,
@@ -1531,9 +1538,9 @@ class distortionr(transformer.Transformer):
       return ret
 
 @registry.register_hparams
-def mnalm_multistep8(): #with mask
+def mnalm10_multistep8(): #with mask
   hparams = transformer.transformer_base_multistep8()
-  hparams.add_hparam("mask_window",1)
+  hparams.add_hparam("mask_window",10)
   return hparams
 
 
